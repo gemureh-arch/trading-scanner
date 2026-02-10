@@ -534,6 +534,85 @@ async def websocket_endpoint(websocket: WebSocket):
         if websocket in connected_clients:
             connected_clients.remove(websocket)
 
+bash
+
+cat > /tmp/debug_endpoint.txt << 'EOF'
+# Add this endpoint to your main.py (before the startup event)
+
+@app.get("/debug/env")
+def debug_env():
+    """Check if API key is loaded"""
+    return {
+        "api_key_set": bool(FINNHUB_API_KEY),
+        "api_key_length": len(FINNHUB_API_KEY) if FINNHUB_API_KEY else 0,
+        "api_key_preview": FINNHUB_API_KEY[:5] + "..." if FINNHUB_API_KEY else "NOT SET"
+    }
+
+@app.get("/debug/market/{symbol}")
+def debug_market(symbol: str):
+    """Debug version with full error details"""
+    import traceback
+    try:
+        if not FINNHUB_API_KEY:
+            return {"error": "API key not set", "key_var": FINNHUB_API_KEY}
+        
+        # Test quote endpoint
+        quote_url = f"{FINNHUB_BASE_URL}/quote"
+        quote_params = {"symbol": symbol, "token": FINNHUB_API_KEY}
+        
+        response = requests.get(quote_url, params=quote_params, timeout=10)
+        
+        return {
+            "status_code": response.status_code,
+            "response": response.json(),
+            "url": quote_url,
+            "symbol": symbol
+        }
+    except Exception as e:
+        return {
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
+EOF
+cat /tmp/debug_endpoint.txt
+Output
+
+# Add this endpoint to your main.py (before the startup event)
+
+@app.get("/debug/env")
+def debug_env():
+    """Check if API key is loaded"""
+    return {
+        "api_key_set": bool(FINNHUB_API_KEY),
+        "api_key_length": len(FINNHUB_API_KEY) if FINNHUB_API_KEY else 0,
+        "api_key_preview": FINNHUB_API_KEY[:5] + "..." if FINNHUB_API_KEY else "NOT SET"
+    }
+
+@app.get("/debug/market/{symbol}")
+def debug_market(symbol: str):
+    """Debug version with full error details"""
+    import traceback
+    try:
+        if not FINNHUB_API_KEY:
+            return {"error": "API key not set", "key_var": FINNHUB_API_KEY}
+        
+        # Test quote endpoint
+        quote_url = f"{FINNHUB_BASE_URL}/quote"
+        quote_params = {"symbol": symbol, "token": FINNHUB_API_KEY}
+        
+        response = requests.get(quote_url, params=quote_params, timeout=10)
+        
+        return {
+            "status_code": response.status_code,
+            "response": response.json(),
+            "url": quote_url,
+            "symbol": symbol
+        }
+    except Exception as e:
+        return {
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
 # ============ STARTUP ============
 @app.on_event("startup")
 async def startup_event():
