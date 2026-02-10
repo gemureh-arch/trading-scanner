@@ -3,12 +3,17 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import asyncio
 import json
-from datetime import datetime
+import os
+from datetime import datetime, timedelta
 from typing import List, Dict
 from pydantic import BaseModel
-import yfinance as yf
+import requests
 import pandas as pd
 import numpy as np
+
+# Finnhub API configuration
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
+FINNHUB_BASE_URL = "https://finnhub.io/api/v1"
 
 app = FastAPI()
 
@@ -61,31 +66,65 @@ class BotToggle(BaseModel):
     enabled: bool
 
 # ============ MARKET DATA ============
-def get_real_market_data(symbol: str, interval: str = "15m", period: str = "5d"):
-    """Fetch real market data using yfinance (15-min delayed)"""
+# ============ MARKET DATA (FINNHUB) ============
+def get_real_market_data(symbol: str, interval: str = "D", period_days: int = 30):
+    """Fetch real market data using Finnhub API"""
     try:
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(period=period, interval=interval)
-        
-        if df.empty:
+        if not FINNHUB_API_KEY:
             return None
         
-        # Get current price (latest close)
-        current_price = float(df['Close'].iloc[-1])
+        # Get current quote (real-time price)
+        quote_url = f"{FINNHUB_BASE_URL}/quote"
+        quote_params = {
+            "symbol": symbol,
+            "token": FINNHUB_API_KEY
+        }
+        quote_response = requests.get(quote_url, params=quote_params, timeout=10)
+        
+        if quote_response.status_code != 200:
+            return None
+        
+        quote_data = quote_response.json()
+        current_price = quote_data.get("c", 0)  # Current price
+        
+        if current_price == 0:
+            return None
+        
+        # Get historical candles for indicators
+        end_time = int(datetime.now().timestamp())
+        start_time = int((datetime.now() - timedelta(days=period_days)).timestamp())
+        
+        candles_url = f"{FINNHUB_BASE_URL}/stock/candle"
+        candles_params = {
+            "symbol": symbol,
+            "resolution": interval,  # D = daily, 60 = hourly, 15 = 15min
+            "from": start_time,
+            "to": end_time,
+            "token": FINNHUB_API_KEY
+        }
+        candles_response = requests.get(candles_url, params=candles_params, timeout=10)
+        
+        if candles_response.status_code != 200:
+            return None
+        
+        candles_data = candles_response.json()
+        
+        if candles_data.get("s") != "ok":
+            return None
+        
+        # Convert to arrays for calculations
+        closes = np.array(candles_data.get("c", []))
+        volumes = np.array(candles_data.get("v", []))
+        
+        if len(closes) < 14:
+            return None
         
         # Calculate indicators
-        prices = df['Close'].values
-        
-        # RSI
-        rsi = calculate_rsi(prices)
-        
-        # EMA
-        ema_9 = calculate_ema(prices, 9)
-        ema_21 = calculate_ema(prices, 21)
-        
-        # Volume
-        avg_volume = df['Volume'].mean()
-        current_volume = float(df['Volume'].iloc[-1])
+        rsi = calculate_rsi(closes)
+        ema_9 = calculate_ema(closes, 9)
+        ema_21 = calculate_ema(closes, 21)
+        avg_volume = np.mean(volumes) if len(volumes) > 0 else 0
+        current_volume = volumes[-1] if len(volumes) > 0 else 0
         
         return {
             "symbol": symbol,
@@ -95,10 +134,13 @@ def get_real_market_data(symbol: str, interval: str = "15m", period: str = "5d")
                 "RSI": rsi,
                 "EMA_9": ema_9,
                 "EMA_21": ema_21,
-                "Volume": current_volume,
-                "Avg_Volume": avg_volume
+                "Volume": float(current_volume),
+                "Avg_Volume": float(avg_volume)
             },
-            "data": df.tail(50).to_dict('records')  # Last 50 candles
+            "data": {
+                "closes": closes[-50:].tolist(),  # Last 50 candles
+                "volumes": volumes[-50:].tolist()
+            }
         }
     except Exception as e:
         print(f"Error fetching data for {symbol}: {str(e)}")
@@ -241,7 +283,7 @@ async def bot_loop():
     global bot_enabled
     
     # Symbols to scan
-    symbols = ["AAPL", "MSFT", "GOOGL", "TSLA", "BTC-USD", "ETH-USD", "EURUSD=X"]
+    symbols = ["AAPL", "MSFT", "GOOGL", "TSLA", "AMZN"]  # Crypto needs different format
     
     while True:
         if bot_enabled:
@@ -249,7 +291,8 @@ async def bot_loop():
             
             for symbol in symbols:
                 try:
-                    market_data = get_real_market_data(symbol)
+                    # Use daily candles for reliable data
+                    market_data = get_real_market_data(symbol, interval="D", period_days=30)
                     if market_data:
                         signal = evaluate_strategy(symbol, market_data, strategy)
                         
@@ -271,8 +314,11 @@ async def bot_loop():
                 
                 except Exception as e:
                     print(f"Bot error for {symbol}: {str(e)}")
+                
+                # Small delay between requests to respect rate limits
+                await asyncio.sleep(2)
         
-        await asyncio.sleep(900)  # Check every 15 minutes (matching data delay)
+        await asyncio.sleep(3600)  # Check every hour
 
 async def broadcast_message(message: dict):
     """Send message to all connected WebSocket clients"""
@@ -321,12 +367,12 @@ def get_market_data(symbol: str):
 @app.get("/scan")
 def scan_markets():
     """Scan multiple markets and return signals"""
-    symbols = ["AAPL", "MSFT", "GOOGL", "TSLA", "AMZN", "BTC-USD", "ETH-USD", "EURUSD=X"]
+    symbols = ["AAPL", "MSFT", "GOOGL", "TSLA", "AMZN", "NVDA", "META", "NFLX"]
     strategy = strategies.get(active_strategy)
     results = []
     
     for symbol in symbols:
-        market_data = get_real_market_data(symbol)
+        market_data = get_real_market_data(symbol, interval="D", period_days=30)
         if market_data:
             signal = evaluate_strategy(symbol, market_data, strategy)
             results.append({
@@ -390,48 +436,50 @@ async def backtest_symbol(symbol: str, days: int = 30):
     """Backtest current strategy on a symbol"""
     try:
         # Get historical data
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(period=f"{days}d", interval="15m")
+        market_data = get_real_market_data(symbol, interval="D", period_days=days)
         
-        if df.empty:
+        if not market_data or "data" not in market_data:
             return {"error": "No data available"}
+        
+        closes = market_data["data"]["closes"]
+        
+        if len(closes) < 14:
+            return {"error": "Not enough historical data"}
         
         strategy = strategies.get(active_strategy)
         trades = []
         balance = 100000.0
         position = None
         
-        for i in range(14, len(df)):  # Start after enough data for RSI
-            prices = df['Close'].iloc[:i+1].values
-            rsi = calculate_rsi(prices)
-            ema_9 = calculate_ema(prices, 9)
-            ema_21 = calculate_ema(prices, 21)
+        for i in range(14, len(closes)):
+            # Calculate indicators for this point
+            prices_slice = closes[:i+1]
+            rsi = calculate_rsi(np.array(prices_slice))
+            ema_9 = calculate_ema(np.array(prices_slice), 9)
+            ema_21 = calculate_ema(np.array(prices_slice), 21)
             
             indicators = {
                 "RSI": rsi,
                 "EMA_9": ema_9,
                 "EMA_21": ema_21,
-                "Volume": df['Volume'].iloc[i],
-                "Avg_Volume": df['Volume'].iloc[:i+1].mean()
+                "Volume": 0,
+                "Avg_Volume": 0
             }
             
-            market_data = {"indicators": indicators, "price": df['Close'].iloc[i]}
-            signal = evaluate_strategy(symbol, market_data, strategy)
+            test_data = {"indicators": indicators, "price": closes[i]}
+            signal = evaluate_strategy(symbol, test_data, strategy)
             
-            if signal == "BUY" and position is None and balance >= df['Close'].iloc[i]:
-                position = {
-                    "entry_price": df['Close'].iloc[i],
-                    "entry_time": df.index[i]
-                }
-                balance -= df['Close'].iloc[i]
+            if signal == "BUY" and position is None and balance >= closes[i]:
+                position = {"entry_price": closes[i], "entry_index": i}
+                balance -= closes[i]
                 trades.append({
                     "action": "BUY",
-                    "price": float(df['Close'].iloc[i]),
-                    "timestamp": str(df.index[i])
+                    "price": float(closes[i]),
+                    "index": i
                 })
             
             elif signal == "SELL" and position is not None:
-                exit_price = df['Close'].iloc[i]
+                exit_price = closes[i]
                 profit = exit_price - position["entry_price"]
                 balance += exit_price
                 
@@ -439,7 +487,7 @@ async def backtest_symbol(symbol: str, days: int = 30):
                     "action": "SELL",
                     "price": float(exit_price),
                     "profit": float(profit),
-                    "timestamp": str(df.index[i])
+                    "index": i
                 })
                 position = None
         
@@ -454,7 +502,7 @@ async def backtest_symbol(symbol: str, days: int = 30):
             "initial_balance": 100000.0,
             "final_balance": balance,
             "total_profit": total_profit,
-            "total_trades": len(trades) // 2,  # Buy + Sell = 1 complete trade
+            "total_trades": len(trades) // 2,
             "winning_trades": len(winning_trades),
             "losing_trades": len(losing_trades),
             "win_rate": len(winning_trades) / max(len(winning_trades) + len(losing_trades), 1) * 100,
